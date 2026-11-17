@@ -1,11 +1,20 @@
-"""Long-form synthesis: voice-design paragraph 1, clone that voice for the rest.
+"""Long-form synthesis in one consistent voice.
+
+The voice comes from one of two places:
+  - Voice design (default): paragraph 1 is spoken in a voice designed from
+    --instruction, and its audio becomes the clone reference for the rest.
+  - A reference clip (--ref-audio and --ref-text, its exact transcript): every
+    paragraph clones that clip. --instruction is then optional and acts as a
+    direction (tone, emotion, pace) on every paragraph, with CFG 4.
 
 Paragraphs in TEXT_FILE are separated by blank lines. Each paragraph is one
-request (capped at 1500 frames, i.e. 120 s of audio).
+request (capped at 1500 frames, i.e. 120 s of audio). In clip mode, the clip,
+its transcript, the direction, the paragraph and its audio share one 2048-frame
+context, so keep the clip short (5-20 s) and paragraphs under about a minute.
 
 Usage:
   uv run longform.py MODEL_DIR TEXT_FILE OUT_WAV [--instruction TEXT] [--seed N]
-                     [--fast] [--keep-chunks]
+                     [--ref-audio WAV --ref-text TEXT] [--fast] [--keep-chunks]
 """
 
 from __future__ import annotations
@@ -40,6 +49,7 @@ MAX_NEW_TOKENS = 1500
 FRAME_RATE = 12.5
 GAP_S = 0.4
 SEED = 42
+DIRECTION_CFG = 4.0  # clip mode with --instruction (the README's Voice Direction setting)
 
 
 def main() -> None:
@@ -49,8 +59,17 @@ def main() -> None:
     p.add_argument("out_wav", type=Path)
     p.add_argument(
         "--instruction",
-        default=DEFAULT_INSTRUCTION,
-        help="voice description used to design the voice in paragraph 1",
+        help="voice description used to design the voice in paragraph 1 "
+        "(default: a warm young woman); with --ref-audio, an optional direction "
+        "for every paragraph",
+    )
+    p.add_argument(
+        "--ref-audio",
+        type=Path,
+        help="clone this clip for every paragraph instead of designing a voice",
+    )
+    p.add_argument(
+        "--ref-text", help="exact transcript of --ref-audio (required with it)"
     )
     p.add_argument(
         "--seed",
@@ -71,9 +90,20 @@ def main() -> None:
         help="also save each paragraph's WAV to OUT_WAV's <name>_chunks/ directory",
     )
     args = p.parse_args()
-    instruction = args.instruction.strip()
-    if not instruction:
-        p.error("--instruction must not be empty")
+    clip = args.ref_audio is not None
+    ref_text = " ".join((args.ref_text or "").split())
+    if clip != bool(ref_text):
+        p.error("--ref-audio and --ref-text must be given together")
+    if clip and not args.ref_audio.is_file():
+        p.error(f"reference audio not found: {args.ref_audio}")
+    if clip:
+        instruction = (args.instruction or "").strip()  # empty: plain clone
+    else:
+        instruction = (
+            DEFAULT_INSTRUCTION if args.instruction is None else args.instruction
+        ).strip()
+        if not instruction:
+            p.error("--instruction must not be empty")
     if not 0 <= args.seed < 2**32:
         p.error("--seed must be between 0 and 4294967295")
 
@@ -121,9 +151,15 @@ def main() -> None:
         torch.cuda.synchronize()
         warm_s = time.perf_counter() - t0
     mode = "fast (all stages except prefill)" if args.fast else "eager"
+    if not clip:
+        voice = "designed"
+    elif instruction:
+        voice = f"clip {args.ref_audio.name} with direction"
+    else:
+        voice = f"clip {args.ref_audio.name}"
     print(
         f"mode: {mode}, warmup {warm_s:.1f}s, {len(paragraphs)} paragraphs, "
-        f"seed {args.seed}"
+        f"seed {args.seed}, voice {voice}"
     )
 
     sr = runtime.sample_rate
@@ -134,7 +170,18 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="longform-") as tmp:
         ref_path = Path(tmp) / "ref.wav"
         for i, text in enumerate(paragraphs):
-            if i == 0:
+            if clip:
+                request = {
+                    "id": f"p{i}",
+                    "text": text,
+                    "speaker": "S0",
+                    "ref_audio_path": str(args.ref_audio),
+                    "ref_text": ref_text,
+                }
+                if instruction:
+                    request["instruction"] = instruction
+                cfg = DIRECTION_CFG if instruction else 1.0
+            elif i == 0:
                 request = {
                     "id": f"p{i}",
                     "text": text,
@@ -180,7 +227,7 @@ def main() -> None:
             gen = time.perf_counter() - t0
 
             wav = np.concatenate(audio)
-            if i == 0:
+            if i == 0 and not clip:
                 sf.write(ref_path, wav, sr, subtype="PCM_16")
             if chunk_dir is not None:
                 sf.write(chunk_dir / f"{i:02d}.wav", wav, sr, subtype="PCM_16")
